@@ -1,0 +1,54 @@
+﻿{
+  "id": "c7195ada-4802-429e-ac66-b48cb7c35c90",
+  "name": "AssemblyVersioning",
+  "friendlyName": "Assembly Versioning",
+  "description": "Applies a version to the AssemblyInfo files in your solution.",
+  "helpMarkDown": "[More Information](https://www.4tecture.ch)",
+  "category": "Utility",
+  "visibility": [
+    "Build"
+  ],
+  "author": "",
+  "version": {
+    "Major": 0,
+    "Minor": 4,
+    "Patch": 0
+  },
+  "demands": [
+  ],
+  "minimumAgentVersion": "1.83.0",
+  "groups": [
+
+  ],
+  "inputs": [
+    {
+      "name": "digitsSetInAssemblyVersion",
+      "type": "pickList",
+      "label": "Digits used in Assembly Version",
+      "defaultValue": "2",
+      "required": true,
+      "options": {
+        "1": "1",
+        "2": "2",
+        "3": "3",
+        "4": "4"
+      }
+    },
+    {
+      "name": "infoversionpostfix",
+      "type": "string",
+      "label": "Version Postfix",
+      "defaultValue": "",
+      "required": false,
+      "helpMarkDown": "Version Postfix for AssemblyInformationalVersion or NuGet Pre-Release Version"
+    }
+  ],
+  "instanceNameFormat": "Assembly Versioning",
+  "execution": {
+    "PowerShell3": {
+      "target": "$(currentDirectory)\\AssemblyVersioning.ps1",
+      "argumentFormat": "",
+      "workingDirectory": "$(currentDirectory)"
+    }
+  }
+}
