@@ -1,4 +1,4 @@
-﻿# Look for a 0.0.0.0 pattern in the build number. 
+# Look for a 0.0.0.0 pattern in the build number. 
 # If found use it to version the assemblies.
 #
 # For example, if the 'Build number format' build process parameter 

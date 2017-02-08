@@ -1,12 +1,4 @@
-# Hash table of known variable info. The formatted env var name is the lookup key.
-#
-# The purpose of this hash table is to keep track of known variables. The hash table
-# needs to be maintained for multiple reasons:
-#  1) to distinguish between env vars and job vars
-#  2) to distinguish between secret vars and public
-#  3) to know the real variable name and not just the formatted env var name.
-$script:knownVariables = @{ }
-$script:vault = @{ }
+$script:secureInputs = @{ }
 
 <#
 .SYNOPSIS
@@ -27,40 +19,32 @@ function Get-Endpoint {
         [string]$Name,
         [switch]$Require)
 
-    $originalErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Stop'
+    # Get the URL.
+    $url = (Get-SecureInput -Name (Get-LocString -Key PSLIB_EndpointUrl0 -ArgumentList $Name) -Path "Env:ENDPOINT_URL_$Name" -Require:$Require)
 
-        # Get the URL.
-        $description = Get-LocString -Key PSLIB_EndpointUrl0 -ArgumentList $Name
-        $key = "ENDPOINT_URL_$Name"
-        $url = Get-VaultValue -Description $description -Key $key -Require:$Require
+    # Short-circuit if not found.
+    if ($Require -and !$url) { return }
 
-        # Get the auth object.
-        $description = Get-LocString -Key PSLIB_EndpointAuth0 -ArgumentList $Name
-        $key = "ENDPOINT_AUTH_$Name"
-        if ($auth = (Get-VaultValue -Description $description -Key $key -Require:$Require)) {
-            $auth = ConvertFrom-Json -InputObject $auth
+    # Get the auth object.
+    if ($auth = (Get-SecureInput -Name (Get-LocString -Key PSLIB_EndpointAuth0 -ArgumentList $Name) -Path "Env:ENDPOINT_AUTH_$Name" -Require:$Require)) {
+        $auth = ConvertFrom-Json -InputObject $auth
+    }
+
+    # Short-circuit if not found.
+    if ($Require -and !$auth) { return }
+
+    # Get the data.
+    if ($data = (Get-SecureInput -Name "'$Name' service endpoint data" -Path "Env:ENDPOINT_DATA_$Name")) {
+        $data = ConvertFrom-Json -InputObject $data
+    }
+
+    # Return the endpoint.
+    if ($url -or $auth -or $data) {
+        New-Object -TypeName psobject -Property @{
+            Url = $url
+            Auth = $auth
+            Data = $data
         }
-
-        # Get the data.
-        $description = "'$Name' service endpoint data"
-        $key = "ENDPOINT_DATA_$Name"
-        if ($data = (Get-VaultValue -Description $description -Key $key)) {
-            $data = ConvertFrom-Json -InputObject $data
-        }
-
-        # Return the endpoint.
-        if ($url -or $auth -or $data) {
-            New-Object -TypeName psobject -Property @{
-                Url = $url
-                Auth = $auth
-                Data = $data
-            }
-        }
-    } catch {
-        $ErrorActionPreference = $originalErrorActionPreference
-        Write-Error $_
     }
 }
 
@@ -95,12 +79,13 @@ function Get-Input {
         [switch]$AsBool,
         [switch]$AsInt)
 
-    # Get the input from the vault. Splat the bound parameters hashtable. Splatting is required
+    # Update the Name in the bound parameters hashtable for downstream user facing
+    # messages (i.e. required error message or interactive prompt).
+    $PSBoundParameters['Name'] = (Get-LocString -Key PSLIB_Input0 -ArgumentList $Name)
+
+    # Get the secure input. Splat the bound parameters hashtable. Splatting is required
     # in order to concisely invoke the correct parameter set.
-    $null = $PSBoundParameters.Remove('Name')
-    $description = Get-LocString -Key PSLIB_Input0 -ArgumentList $Name
-    $key = "INPUT_$($Name.Replace(' ', '_').ToUpperInvariant())"
-    Get-VaultValue @PSBoundParameters -Description $description -Key $key
+    Get-SecureInput @PSBoundParameters -Path "Env:INPUT_$($Name.Replace(' ', '_').ToUpperInvariant())"
 }
 
 <#
@@ -134,71 +119,34 @@ function Get-TaskVariable {
         [switch]$AsBool,
         [switch]$AsInt)
 
-    $originalErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Stop'
-        $description = Get-LocString -Key PSLIB_TaskVariable0 -ArgumentList $Name
-        $variableKey = Get-VariableKey -Name $Name
-        if ($script:knownVariables.$variableKey.Secret) {
-            # Get secret variable. Splatting is required to concisely invoke the correct parameter set.
-            $null = $PSBoundParameters.Remove('Name')
-            $vaultKey = "SECRET_$variableKey"
-            Get-VaultValue @PSBoundParameters -Description $description -Key $vaultKey
-        } else {
-            # Get public variable.
-            $item = $null
-            $path = "Env:$variableKey"
-            if ((Test-Path -LiteralPath $path) -and ($item = Get-Item -LiteralPath $path).Value) {
-                # Intentionally empty. Value was successfully retrieved.
-            } elseif (!$script:nonInteractive) {
-                # The value wasn't found and the module is running in interactive dev mode.
-                # Prompt for the value.
-                Set-Item -LiteralPath $path -Value (Read-Host -Prompt $description)
-                if (Test-Path -LiteralPath $path) {
-                    $item = Get-Item -LiteralPath $path
-                }
+    # Update the Name in the bound parameters hashtable for downstream user facing
+    # messages (i.e. required error message or interactive prompt).
+    $PSBoundParameters['Name'] = Get-LocString -Key PSLIB_TaskVariable0 -ArgumentList $Name
+
+    # Attempt to get the secret variable.
+    $value = $null
+    $path = "Env:SECRET_$(Format-VariableName $Name)"
+    if ($psCredential = $script:secureInputs[$path]) {
+        # The secret variable was found.
+        $value = $psCredential.GetNetworkCredential().Password
+        Get-FinalValue @PSBoundParameters -Path $path -Value $value
+    } else {
+        # Attempt to get the environment variable.
+        $item = $null
+        $path = "Env:$(Format-VariableName $Name)"
+        if ((Test-Path -LiteralPath $path) -and ($item = Get-Item -LiteralPath $path).Value) {
+            # Intentionally empty.
+        } elseif (!$script:nonInteractive) {
+            # The value wasn't found. Prompt for the value if running in interactive dev mode.
+            Set-Item -LiteralPath $path -Value (Read-Host -Prompt $Name)
+            if (Test-Path -LiteralPath $path) {
+                $item = Get-Item -LiteralPath $path
             }
-
-            # Get the converted value. Splatting is required to concisely invoke the correct parameter set.
-            $null = $PSBoundParameters.Remove('Name')
-            Get-Value @PSBoundParameters -Description $description -Key $variableKey -Value $item.Value
         }
-    } catch {
-        $ErrorActionPreference = $originalErrorActionPreference
-        Write-Error $_
-    }
-}
 
-<#
-.SYNOPSIS
-Gets all job variables available to the task. Requires 2.104.1 agent or higher.
-
-.DESCRIPTION
-Gets a snapshot of the current state of all job variables available to the task.
-Requires a 2.104.1 agent or higher for full functionality.
-
-Returns an array of objects with the following properties:
-    [string]Name
-    [string]Value
-    [bool]Secret
-
-Limitations on an agent prior to 2.104.1:
- 1) The return value does not include all public variables. Only public variables
-    that have been added using setVariable are returned.
- 2) The name returned for each secret variable is the formatted environment variable
-    name, not the actual variable name (unless it was set explicitly at runtime using
-    setVariable).
-#>
-function Get-TaskVariableInfo {
-    [CmdletBinding()]
-    param()
-
-    foreach ($info in $script:knownVariables.Values) {
-        New-Object -TypeName psobject -Property @{
-            Name = $info.Name
-            Value = Get-TaskVariable -Name $info.Name
-            Secret = $info.Secret
-        }
+        # Get the converted value. Splat the bound parameters hashtable. Splatting is required
+        # in order to concisely invoke the correct parameter set.
+        Get-FinalValue @PSBoundParameters -Path $path -Value $item.Value
     }
 }
 
@@ -217,36 +165,10 @@ function Set-TaskVariable {
         [string]$Value,
         [switch]$Secret)
 
-    # Once a secret always a secret.
-    $variableKey = Get-VariableKey -Name $Name
-    [bool]$Secret = $Secret -or $script:knownVariables.$variableKey.Secret
-    if ($Secret) {
-        $vaultKey = "SECRET_$variableKey"
-        if (!$Value) {
-            # Clear the secret.
-            Write-Verbose "Set $Name = ''"
-            $script:vault.Remove($vaultKey)
-        } else {
-            # Store the secret in the vault.
-            Write-Verbose "Set $Name = '********'"
-            $script:vault[$vaultKey] = New-Object System.Management.Automation.PSCredential(
-                $vaultKey,
-                (ConvertTo-SecureString -String $Value -AsPlainText -Force))
-        }
-
-        # Clear the environment variable.
-        Set-Item -LiteralPath "Env:$variableKey" -Value ''
-    } else {
-        # Set the environment variable.
-        Write-Verbose "Set $Name = '$Value'"
-        Set-Item -LiteralPath "Env:$variableKey" -Value $Value
-    }
-
-    # Store the metadata.
-    $script:knownVariables[$variableKey] = New-Object -TypeName psobject -Property @{
-            Name = $name
-            Secret = $Secret
-        }
+    # Set the environment variable.
+    $path = "Env:$(Format-VariableName $Name)"
+    Write-Verbose "Set $path = '$(if ($Secret) { '********' } else { $Value })'"
+    Set-Item -LiteralPath $path -Value $Value
 
     # Persist the variable in the task context.
     Write-SetVariable -Name $Name -Value $Value -Secret:$Secret
@@ -255,13 +177,13 @@ function Set-TaskVariable {
 ########################################
 # Private functions.
 ########################################
-function Get-VaultValue {
+function Get-SecureInput {
     [CmdletBinding(DefaultParameterSetName = 'Require')]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Description,
+        [string]$Name,
         [Parameter(Mandatory = $true)]
-        [string]$Key,
+        [string]$Path,
         [Parameter(ParameterSetName = 'Require')]
         [switch]$Require,
         [Parameter(ParameterSetName = 'Default')]
@@ -269,31 +191,31 @@ function Get-VaultValue {
         [switch]$AsBool,
         [switch]$AsInt)
 
-    # Attempt to get the vault value.
+    # Attempt to get the secure variable.
     $value = $null
-    if ($psCredential = $script:vault[$Key]) {
+    if ($psCredential = $script:secureInputs[$Path]) {
         $value = $psCredential.GetNetworkCredential().Password
     } elseif (!$script:nonInteractive) {
         # The value wasn't found. Prompt for the value if running in interactive dev mode.
-        $value = Read-Host -Prompt $Description
+        $value = Read-Host -Prompt $Name
         if ($value) {
-            $script:vault[$Key] = New-Object System.Management.Automation.PSCredential(
-                $Key,
+            $script:secureInputs[$Path] = New-Object System.Management.Automation.PSCredential(
+                $Path,
                 (ConvertTo-SecureString -String $value -AsPlainText -Force))
         }
     }
 
-    Get-Value -Value $value @PSBoundParameters
+    Get-FinalValue -Value $value @PSBoundParameters
 }
 
-function Get-Value {
+function Get-FinalValue {
     [CmdletBinding(DefaultParameterSetName = 'Require')]
     param(
         [string]$Value,
         [Parameter(Mandatory = $true)]
-        [string]$Description,
+        [string]$Name,
         [Parameter(Mandatory = $true)]
-        [string]$Key,
+        [string]$Path,
         [Parameter(ParameterSetName = 'Require')]
         [switch]$Require,
         [Parameter(ParameterSetName = 'Default')]
@@ -303,24 +225,23 @@ function Get-Value {
 
     $result = $Value
     if ($result) {
-        if ($Key -like 'ENDPOINT_AUTH_*') {
-            Write-Verbose "$($Key): '********'"
+        if ($Path -like 'Env:ENDPOINT_AUTH_*') {
+            Write-Verbose "$($Path): '********'"
         } else {
-            Write-Verbose "$($Key): '$result'"
+            Write-Verbose "$($Path): '$result'"
         }
     } else {
-        Write-Verbose "$Key (empty)"
+        Write-Verbose "$Path (empty)"
 
         # Write error if required.
         if ($Require) {
-            Write-Error "$(Get-LocString -Key PSLIB_Required0 $Description)"
+            Write-Error "$(Get-LocString -Key PSLIB_Required0 $Name)"
             return
         }
 
         # Fallback to the default if provided.
         if ($PSCmdlet.ParameterSetName -eq 'Default') {
             $result = $Default
-            $OFS = ' '
             Write-Verbose " Defaulted to: '$result'"
         } else {
             $result = ''
@@ -355,63 +276,22 @@ function Get-Value {
     return $result
 }
 
-function Initialize-Inputs {
-    # Store endpoints, inputs, and secret variables in the vault.
-    foreach ($variable in (Get-ChildItem -Path Env:ENDPOINT_?*, Env:INPUT_?*, Env:SECRET_?*)) {
-        # Record the secret variable metadata. This is required by Get-TaskVariable to
-        # retrieve the value. In a 2.104.1 agent or higher, this metadata will be overwritten
-        # when $env:VSTS_SECRET_VARIABLES is processed.
-        if ($variable.Name -like 'SECRET_?*') {
-            $variableKey = $variable.Name.Substring('SECRET_'.Length)
-            $script:knownVariables[$variableKey] = New-Object -TypeName psobject -Property @{
-                # This is technically not the variable name (has underscores instead of dots),
-                # but it's good enough to make Get-TaskVariable work in a pre-2.104.1 agent
-                # where $env:VSTS_SECRET_VARIABLES is not defined.
-                Name = $variableKey
-                Secret = $true
-            }
-        }
-
-        # Store the value in the vault.
-        $vaultKey = $variable.Name
+function Initialize-SecureInputs {
+    # Store endpoints/inputs in a secure fashion.
+    foreach ($variable in (Get-ChildItem -Path Env:ENDPOINT_*, Env:INPUT_*, Env:SECRET_*)) {
+        $path = "Env:$($variable.Name)"
         if ($variable.Value) {
-            $script:vault[$vaultKey] = New-Object System.Management.Automation.PSCredential(
-                $vaultKey,
+            $script:secureInputs[$path] = New-Object System.Management.Automation.PSCredential(
+                $path,
                 (ConvertTo-SecureString -String $variable.Value -AsPlainText -Force))
         }
 
         # Clear the environment variable.
-        Remove-Item -LiteralPath "Env:$($variable.Name)"
-    }
-
-    # Record the public variable names. Env var added in 2.104.1 agent.
-    if ($env:VSTS_PUBLIC_VARIABLES) {
-        foreach ($name in (ConvertFrom-Json -InputObject $env:VSTS_PUBLIC_VARIABLES)) {
-            $variableKey = Get-VariableKey -Name $name
-            $script:knownVariables[$variableKey] = New-Object -TypeName psobject -Property @{
-                Name = $name
-                Secret = $false
-            }
-        }
-
-        $env:VSTS_PUBLIC_VARIABLES = ''
-    }
-
-    # Record the secret variable names. Env var added in 2.104.1 agent.
-    if ($env:VSTS_SECRET_VARIABLES) {
-        foreach ($name in (ConvertFrom-Json -InputObject $env:VSTS_SECRET_VARIABLES)) {
-            $variableKey = Get-VariableKey -Name $name
-            $script:knownVariables[$variableKey] = New-Object -TypeName psobject -Property @{
-                Name = $name
-                Secret = $true
-            }
-        }
-
-        $env:VSTS_SECRET_VARIABLES = ''
+        Remove-Item -LiteralPath $path
     }
 }
 
-function Get-VariableKey {
+function Format-VariableName {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
